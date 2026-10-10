@@ -11,8 +11,8 @@
 #define COLA_MAX_MENSAJES 10
 
 /*
- * Valor reservado para indicar a un worker
- * que no quedan mas mediciones.
+ * Mensaje especial para indicar
+ * que un worker debe terminar.
  */
 #define SENSOR_FIN -1
 
@@ -24,7 +24,8 @@
 #define SEM_ESTADISTICAS_NOMBRE "/scada_sem_estadisticas"
 
 /*
- * Mensaje enviado por los procesos sensores.
+ * Mensaje que genera un sensor
+ * y viaja por la cola.
  */
 struct Medicion
 {
@@ -36,7 +37,7 @@ struct Medicion
 /*
  * Estadisticas acumuladas.
  *
- * El promedio no se almacena porque puede calcularse
+ * No guardamos promedio porque se calcula
  * como suma / cantidad.
  */
 struct Estadistica
@@ -49,10 +50,10 @@ struct Estadistica
 };
 
 /*
- * Estado que vive en memoria compartida.
+ * Estructura que vive en memoria compartida.
  *
- * Los workers lo modifican y el programa consulta
- * podra leerlo desde otro proceso.
+ * Contiene las estadisticas de cada sensor
+ * y las estadisticas globales.
  */
 struct MemoriaCompartida
 {
