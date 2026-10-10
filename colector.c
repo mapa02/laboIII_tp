@@ -17,10 +17,12 @@
 #define VALOR_MIN 0.0
 #define VALOR_MAX 100.0
 
-
 /*
- * Informacion que recibe cada worker.
+ * 200 milisegundos entre mediciones.
  */
+#define INTERVALO_NANOSEGUNDOS 200000000L
+
+
 struct DatosWorker
 {
     int id;
@@ -30,10 +32,6 @@ struct DatosWorker
 };
 
 
-/*
- * Elimina recursos que hayan quedado
- * de una ejecucion anterior.
- */
 void limpiar_recursos_anteriores(void)
 {
     mq_unlink(COLA_NOMBRE);
@@ -42,10 +40,6 @@ void limpiar_recursos_anteriores(void)
 }
 
 
-/*
- * Crea la cola POSIX utilizada para transportar
- * mediciones desde los sensores hacia los workers.
- */
 mqd_t crear_cola(void)
 {
     struct mq_attr attr;
@@ -72,19 +66,12 @@ mqd_t crear_cola(void)
 }
 
 
-/*
- * Crea la memoria compartida donde se guardan
- * las estadisticas del sistema.
- */
 struct MemoriaCompartida *crear_memoria_compartida(
     int cantidad_sensores)
 {
     int fd;
     struct MemoriaCompartida *memoria;
 
-    /*
-     * 1. Crear/abrir memoria compartida.
-     */
     fd = shm_open(
         SHM_NOMBRE,
         O_CREAT | O_RDWR,
@@ -97,9 +84,6 @@ struct MemoriaCompartida *crear_memoria_compartida(
         return NULL;
     }
 
-    /*
-     * 2. Darle tamaño.
-     */
     if (ftruncate(
             fd,
             sizeof(struct MemoriaCompartida)) == -1)
@@ -107,13 +91,9 @@ struct MemoriaCompartida *crear_memoria_compartida(
         perror("ftruncate");
         close(fd);
         shm_unlink(SHM_NOMBRE);
-
         return NULL;
     }
 
-    /*
-     * 3. Mapearla al espacio del proceso.
-     */
     memoria = mmap(
         NULL,
         sizeof(struct MemoriaCompartida),
@@ -129,13 +109,9 @@ struct MemoriaCompartida *crear_memoria_compartida(
     {
         perror("mmap");
         shm_unlink(SHM_NOMBRE);
-
         return NULL;
     }
 
-    /*
-     * Inicializar todo en cero.
-     */
     memset(
         memoria,
         0,
@@ -148,12 +124,6 @@ struct MemoriaCompartida *crear_memoria_compartida(
 }
 
 
-/*
- * Crea el semaforo que protege
- * las estadisticas compartidas.
- *
- * Valor inicial 1 = exclusion mutua.
- */
 sem_t *crear_semaforo_estadisticas(void)
 {
     sem_t *sem;
@@ -174,10 +144,6 @@ sem_t *crear_semaforo_estadisticas(void)
 }
 
 
-/*
- * Genera un valor aleatorio entre
- * VALOR_MIN y VALOR_MAX.
- */
 double generar_valor(void)
 {
     double proporcion;
@@ -193,8 +159,20 @@ double generar_valor(void)
 
 
 /*
- * Codigo ejecutado por cada proceso sensor.
+ * Simula el intervalo de tiempo entre
+ * una medicion del sensor y la siguiente.
  */
+void esperar_entre_mediciones(void)
+{
+    struct timespec espera;
+
+    espera.tv_sec = 0;
+    espera.tv_nsec = INTERVALO_NANOSEGUNDOS;
+
+    nanosleep(&espera, NULL);
+}
+
+
 int ejecutar_sensor(int sensor_id, int cantidad)
 {
     mqd_t cola_sensor;
@@ -231,7 +209,6 @@ int ejecutar_sensor(int sensor_id, int cantidad)
         {
             perror("mq_send");
             mq_close(cola_sensor);
-
             return -1;
         }
 
@@ -241,6 +218,15 @@ int ejecutar_sensor(int sensor_id, int cantidad)
             i + 1,
             medicion.valor
         );
+
+        /*
+         * No esperamos despues de la ultima
+         * medicion porque el sensor ya termino.
+         */
+        if (i + 1 < cantidad)
+        {
+            esperar_entre_mediciones();
+        }
     }
 
     mq_close(cola_sensor);
@@ -249,20 +235,10 @@ int ejecutar_sensor(int sensor_id, int cantidad)
 }
 
 
-/*
- * Actualiza las estadisticas con un nuevo valor.
- *
- * Esta funcion supone que quien la llama
- * ya tomo el semaforo.
- */
 void actualizar_estadistica(
     struct Estadistica *estadistica,
     double valor)
 {
-    /*
-     * La primera medicion inicializa
-     * minimo y maximo.
-     */
     if (estadistica->cantidad == 0)
     {
         estadistica->minimo = valor;
@@ -287,12 +263,6 @@ void actualizar_estadistica(
 }
 
 
-/*
- * Procesa una medicion.
- *
- * Actualiza tanto las estadisticas
- * del sensor como las globales.
- */
 int procesar_medicion(
     struct DatosWorker *datos,
     struct Medicion *medicion)
@@ -313,9 +283,6 @@ int procesar_medicion(
         return -1;
     }
 
-    /*
-     * Entrar a la seccion critica.
-     */
     if (sem_wait(datos->sem_estadisticas) == -1)
     {
         perror("sem_wait");
@@ -332,9 +299,6 @@ int procesar_medicion(
         medicion->valor
     );
 
-    /*
-     * Salir de la seccion critica.
-     */
     if (sem_post(datos->sem_estadisticas) == -1)
     {
         perror("sem_post");
@@ -345,9 +309,6 @@ int procesar_medicion(
 }
 
 
-/*
- * Funcion ejecutada por cada worker thread.
- */
 void *funcion_worker(void *arg)
 {
     struct DatosWorker *datos;
@@ -376,9 +337,6 @@ void *funcion_worker(void *arg)
             return NULL;
         }
 
-        /*
-         * Mensaje especial de terminacion.
-         */
         if (medicion.sensor_id == SENSOR_FIN)
         {
             break;
@@ -408,9 +366,6 @@ void *funcion_worker(void *arg)
 }
 
 
-/*
- * Muestra las estadisticas finales.
- */
 void mostrar_resumen(
     struct MemoriaCompartida *memoria)
 {
@@ -474,6 +429,7 @@ int main(int argc, char *argv[])
     int error;
 
     pid_t pid;
+
     mqd_t cola;
 
     struct MemoriaCompartida *memoria;
@@ -484,15 +440,12 @@ int main(int argc, char *argv[])
 
     struct Medicion fin;
 
-    /*
-     * argv[1] = cantidad de sensores
-     * argv[2] = mediciones por sensor
-     */
     if (argc != 3)
     {
         fprintf(
             stderr,
-            "Uso: %s <sensores> <mediciones_por_sensor>\n",
+            "Uso: %s <sensores> "
+            "<mediciones_por_sensor>\n",
             argv[0]
         );
 
@@ -526,15 +479,8 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    /*
-     * Limpiar recursos viejos antes
-     * de comenzar una nueva ejecucion.
-     */
     limpiar_recursos_anteriores();
 
-    /*
-     * Crear recursos IPC.
-     */
     cola = crear_cola();
 
     if (cola == (mqd_t)-1)
@@ -578,15 +524,19 @@ int main(int argc, char *argv[])
         "Sensores: %d\n",
         cantidad_sensores
     );
+
     printf(
         "Mediciones por sensor: %d\n\n",
         mediciones_por_sensor
     );
 
     /*
-     * Crear un proceso hijo por sensor.
+     * Creamos todos los procesos sensores
+     * antes de crear los threads workers.
      */
-    for (i = 0; i < cantidad_sensores; i++)
+    for (i = 0;
+         i < cantidad_sensores;
+         i++)
     {
         pid = fork();
 
@@ -600,17 +550,12 @@ int main(int argc, char *argv[])
         {
             int resultado;
 
-            /*
-             * El hijo no usa directamente
-             * el descriptor heredado.
-             */
             mq_close(cola);
 
-            resultado =
-                ejecutar_sensor(
-                    i,
-                    mediciones_por_sensor
-                );
+            resultado = ejecutar_sensor(
+                i,
+                mediciones_por_sensor
+            );
 
             if (resultado == -1)
             {
@@ -622,9 +567,11 @@ int main(int argc, char *argv[])
     }
 
     /*
-     * Crear el pool de worker threads.
+     * Creamos el pool fijo de workers.
      */
-    for (i = 0; i < CANT_WORKERS; i++)
+    for (i = 0;
+         i < CANT_WORKERS;
+         i++)
     {
         datos_workers[i].id = i;
         datos_workers[i].cola = cola;
@@ -652,24 +599,27 @@ int main(int argc, char *argv[])
     }
 
     /*
-     * Esperar a que terminen
-     * todos los sensores.
+     * Esperamos a que todos los sensores
+     * terminen de producir mediciones.
      */
-    for (i = 0; i < cantidad_sensores; i++)
+    for (i = 0;
+         i < cantidad_sensores;
+         i++)
     {
         wait(NULL);
     }
 
     /*
-     * Una vez terminados los sensores,
-     * avisar a los workers que no habra
-     * nuevas mediciones.
+     * Ya no pueden aparecer mediciones nuevas.
+     * Enviamos un mensaje de fin por worker.
      */
     fin.timestamp = time(NULL);
     fin.valor = 0.0;
     fin.sensor_id = SENSOR_FIN;
 
-    for (i = 0; i < CANT_WORKERS; i++)
+    for (i = 0;
+         i < CANT_WORKERS;
+         i++)
     {
         if (mq_send(
                 cola,
@@ -683,9 +633,12 @@ int main(int argc, char *argv[])
     }
 
     /*
-     * Esperar a los worker threads.
+     * Esperamos la terminacion de todos
+     * los workers.
      */
-    for (i = 0; i < CANT_WORKERS; i++)
+    for (i = 0;
+         i < CANT_WORKERS;
+         i++)
     {
         pthread_join(
             workers[i],
@@ -693,16 +646,15 @@ int main(int argc, char *argv[])
         );
     }
 
-    /*
-     * Mostrar resultados finales.
-     */
     mostrar_resumen(memoria);
 
     /*
-     * Liberar recursos IPC.
+     * Liberacion ordenada de recursos IPC.
      */
     sem_close(sem_estadisticas);
-    sem_unlink(SEM_ESTADISTICAS_NOMBRE);
+    sem_unlink(
+        SEM_ESTADISTICAS_NOMBRE
+    );
 
     munmap(
         memoria,
