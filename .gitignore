@@ -1,0 +1,3 @@
+colector
+*.o
+.DS_Store
