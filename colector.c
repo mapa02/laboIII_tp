@@ -26,10 +26,54 @@
 #define INTERVALO_NANOSEGUNDOS 200000000L
 
 
+volatile sig_atomic_t detener = 0;
+volatile sig_atomic_t reporte_manual = 0;
+volatile sig_atomic_t reporte_periodico = 0;
+
+
+void manejar_senal(int senal)
+{
+    if (senal == SIGINT)
+    {
+        detener = 1;
+    }
+    else if (senal == SIGUSR1)
+    {
+        reporte_manual = 1;
+    }
+    else if (senal == SIGALRM)
+    {
+        reporte_periodico = 1;
+    }
+}
+
+
+int instalar_senales(void)
+{
+    struct sigaction accion;
+
+    memset(&accion, 0, sizeof(accion));
+    accion.sa_handler = manejar_senal;
+    sigemptyset(&accion.sa_mask);
+
+    if (sigaction(SIGINT, &accion, NULL) == -1 ||
+        sigaction(SIGUSR1, &accion, NULL) == -1 ||
+        sigaction(SIGALRM, &accion, NULL) == -1)
+    {
+        perror("sigaction");
+        return -1;
+    }
+
+    return 0;
+}
+
+
 struct DatosWorker
 {
     int id;
     mqd_t cola;
+    mqd_t cola_alertas;
+    double umbral;
     struct MemoriaCompartida *memoria;
     sem_t *sem_estadisticas;
 };
@@ -66,6 +110,76 @@ mqd_t crear_cola(void)
     }
 
     return cola;
+}
+
+
+
+mqd_t crear_cola_alertas(void)
+{
+    struct mq_attr attr;
+    mqd_t cola;
+
+    attr.mq_flags = 0;
+    attr.mq_maxmsg = COLA_MAX_MENSAJES;
+    attr.mq_msgsize = sizeof(struct Alerta);
+    attr.mq_curmsgs = 0;
+
+    cola = mq_open(COLA_ALERTAS_NOMBRE,
+                   O_CREAT | O_RDWR, 0600, &attr);
+
+    if (cola == (mqd_t)-1)
+    {
+        perror("mq_open alertas");
+    }
+
+    return cola;
+}
+
+
+void *funcion_logger(void *arg)
+{
+    mqd_t cola = *(mqd_t *)arg;
+    struct Alerta alerta;
+    ssize_t bytes;
+    FILE *archivo;
+
+    archivo = fopen(ARCHIVO_LOG, "w");
+
+    if (archivo == NULL)
+    {
+        perror("fopen monitoreo.log");
+        return NULL;
+    }
+
+    while (1)
+    {
+        bytes = mq_receive(cola, (char *)&alerta,
+                           sizeof(alerta), NULL);
+
+        if (bytes == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            perror("mq_receive alertas");
+            break;
+        }
+
+        if (alerta.sensor_id == ALERTA_FIN)
+            break;
+
+        fprintf(archivo,
+                "Sensor %d | Valor: %.2f | Umbral: %.2f | Timestamp: %ld\n",
+                alerta.sensor_id,
+                alerta.valor,
+                alerta.umbral,
+                (long)alerta.timestamp);
+
+        fflush(archivo);
+    }
+
+    fclose(archivo);
+    return NULL;
 }
 
 
@@ -316,6 +430,7 @@ void *funcion_worker(void *arg)
 {
     struct DatosWorker *datos;
     struct Medicion medicion;
+    struct Alerta alerta;
     ssize_t bytes;
 
     datos = (struct DatosWorker *)arg;
@@ -350,6 +465,24 @@ void *funcion_worker(void *arg)
                 &medicion) == -1)
         {
             return NULL;
+        }
+
+        if (medicion.valor > datos->umbral)
+        {
+            alerta.timestamp = medicion.timestamp;
+            alerta.sensor_id = medicion.sensor_id;
+            alerta.valor = medicion.valor;
+            alerta.umbral = datos->umbral;
+
+            if (mq_send(
+                    datos->cola_alertas,
+                    (char *)&alerta,
+                    sizeof(struct Alerta),
+                    0) == -1)
+            {
+                perror("mq_send alerta");
+                return NULL;
+            }
         }
 
         printf(
@@ -425,6 +558,45 @@ void mostrar_resumen(
 
 
 
+
+void atender_reportes(
+    struct MemoriaCompartida *memoria,
+    sem_t *semaforo,
+    int intervalo)
+{
+    struct MemoriaCompartida copia;
+
+    if (!reporte_manual && !reporte_periodico)
+        return;
+
+    if (reporte_periodico)
+    {
+        reporte_periodico = 0;
+        alarm((unsigned int)intervalo);
+    }
+
+    reporte_manual = 0;
+
+    if (sem_wait(semaforo) == -1)
+    {
+        perror("sem_wait reporte");
+        return;
+    }
+
+    copia = *memoria;
+
+    if (sem_post(semaforo) == -1)
+    {
+        perror("sem_post reporte");
+        return;
+    }
+
+    printf("\\n[REPORTE DE ESTADISTICAS]\\n");
+    mostrar_resumen(&copia);
+    fflush(stdout);
+}
+
+
 /*
  * Convierte un argumento a entero.
  * Devuelve 0 si es valido y -1 si es invalido.
@@ -457,6 +629,8 @@ int main(int argc, char *argv[])
 {
     int cantidad_sensores;
     int mediciones_por_sensor;
+    int umbral_alertas;
+    int intervalo_reportes;
     int i;
     int error;
 
@@ -467,21 +641,24 @@ int main(int argc, char *argv[])
     int sensores_con_error = 0;
 
     mqd_t cola;
+    mqd_t cola_alertas;
 
     struct MemoriaCompartida *memoria;
     sem_t *sem_estadisticas;
 
+    pthread_t logger;
     pthread_t workers[CANT_WORKERS];
     struct DatosWorker datos_workers[CANT_WORKERS];
 
     struct Medicion fin;
+    struct Alerta fin_alerta;
 
-    if (argc != 3)
+    if (argc != 5)
     {
         fprintf(
             stderr,
             "Uso: %s <sensores> "
-            "<mediciones_por_sensor>\n",
+            "<mediciones_por_sensor> <umbral>\n",
             argv[0]
         );
 
@@ -497,6 +674,13 @@ int main(int argc, char *argv[])
     if (convertir_entero(argv[2], &mediciones_por_sensor) == -1)
     {
         fprintf(stderr, "Error: cantidad de mediciones invalida.\\n");
+        return EXIT_FAILURE;
+    }
+
+    if (convertir_entero(argv[3], &umbral_alertas) == -1 ||
+        umbral_alertas < 0 || umbral_alertas > 100)
+    {
+        fprintf(stderr, "Umbral invalido (0 a 100).\n");
         return EXIT_FAILURE;
     }
 
@@ -521,6 +705,18 @@ int main(int argc, char *argv[])
             "debe ser mayor a 0\n"
         );
 
+        return EXIT_FAILURE;
+    }
+
+    if (convertir_entero(argv[4], &intervalo_reportes) == -1 ||
+        intervalo_reportes < 1)
+    {
+        fprintf(stderr, "Intervalo de reportes invalido.\\n");
+        return EXIT_FAILURE;
+    }
+
+    if (instalar_senales() == -1)
+    {
         return EXIT_FAILURE;
     }
 
@@ -643,6 +839,28 @@ int main(int argc, char *argv[])
         sensores_creados++;
     }
 
+    /* Crear la segunda cola e iniciar el logger. */
+    cola_alertas = crear_cola_alertas();
+
+    if (cola_alertas == (mqd_t)-1)
+    {
+        fprintf(stderr, "No se pudo crear la cola de alertas.\n");
+        return EXIT_FAILURE;
+    }
+
+    error = pthread_create(
+        &logger, NULL, funcion_logger, &cola_alertas
+    );
+
+    if (error != 0)
+    {
+        fprintf(stderr, "Error creando logger: %s\n",
+                strerror(error));
+        mq_close(cola_alertas);
+        mq_unlink(COLA_ALERTAS_NOMBRE);
+        return EXIT_FAILURE;
+    }
+
     /*
      * Creamos el pool fijo de workers.
      */
@@ -652,6 +870,8 @@ int main(int argc, char *argv[])
     {
         datos_workers[i].id = i;
         datos_workers[i].cola = cola;
+        datos_workers[i].cola_alertas = cola_alertas;
+        datos_workers[i].umbral = (double)umbral_alertas;
         datos_workers[i].memoria = memoria;
         datos_workers[i].sem_estadisticas =
             sem_estadisticas;
@@ -752,6 +972,8 @@ int main(int argc, char *argv[])
         }
     }
 
+    alarm((unsigned int)intervalo_reportes);
+
     /*
      * Esperamos a que todos los sensores
      * terminen de producir mediciones.
@@ -765,8 +987,19 @@ int main(int argc, char *argv[])
         do
         {
             terminado = waitpid(pids[i], &estado, 0);
+
+            if (terminado == -1 && errno == EINTR)
+            {
+                atender_reportes(
+                    memoria, sem_estadisticas, intervalo_reportes
+                );
+            }
         }
         while (terminado == -1 && errno == EINTR);
+
+        atender_reportes(
+            memoria, sem_estadisticas, intervalo_reportes
+        );
 
         if (terminado == -1)
         {
@@ -782,6 +1015,8 @@ int main(int argc, char *argv[])
             sensores_con_error = 1;
         }
     }
+
+    alarm(0);
 
     /*
      * Ya no pueden aparecer mediciones nuevas.
@@ -819,6 +1054,24 @@ int main(int argc, char *argv[])
             NULL
         );
     }
+
+    /* Los workers ya no generan nuevas alertas. */
+    fin_alerta.timestamp = time(NULL);
+    fin_alerta.sensor_id = ALERTA_FIN;
+    fin_alerta.valor = 0.0;
+    fin_alerta.umbral = 0.0;
+
+    if (mq_send(cola_alertas, (char *)&fin_alerta,
+                sizeof(fin_alerta), 0) == -1)
+    {
+        perror("mq_send fin alerta");
+        return EXIT_FAILURE;
+    }
+
+    pthread_join(logger, NULL);
+
+    mq_close(cola_alertas);
+    mq_unlink(COLA_ALERTAS_NOMBRE);
 
     mostrar_resumen(memoria);
 

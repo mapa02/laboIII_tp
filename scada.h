@@ -20,6 +20,9 @@
  * Nombres de recursos IPC POSIX.
  */
 #define COLA_NOMBRE "/scada_mediciones"
+#define COLA_ALERTAS_NOMBRE "/scada_alertas"
+#define ARCHIVO_LOG "monitoreo.log"
+#define ALERTA_FIN -1
 #define SHM_NOMBRE "/scada_estadisticas"
 #define SEM_ESTADISTICAS_NOMBRE "/scada_sem_estadisticas"
 
@@ -39,6 +42,21 @@ struct Medicion
  *
  * No guardamos promedio porque se calcula
  * como suma / cantidad.
+ */
+/*
+ * Mensaje enviado por un worker al logger
+ * cuando una medicion supera el umbral.
+ */
+struct Alerta
+{
+    time_t timestamp;
+    int sensor_id;
+    double valor;
+    double umbral;
+};
+
+/*
+ * Estadisticas acumuladas.
  */
 struct Estadistica
 {
