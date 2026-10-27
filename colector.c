@@ -1,5 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <signal.h>
+#include <limits.h>
 #include <string.h>
 #include <fcntl.h>
 #include <mqueue.h>
@@ -421,6 +424,35 @@ void mostrar_resumen(
 }
 
 
+
+/*
+ * Convierte un argumento a entero.
+ * Devuelve 0 si es valido y -1 si es invalido.
+ */
+int convertir_entero(const char *texto, int *resultado)
+{
+    char *fin;
+    long numero;
+
+    errno = 0;
+    numero = strtol(texto, &fin, 10);
+
+    if (texto == fin || *fin != '\0')
+    {
+        return -1;
+    }
+
+    if (errno == ERANGE ||
+        numero < INT_MIN ||
+        numero > INT_MAX)
+    {
+        return -1;
+    }
+
+    *resultado = (int)numero;
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     int cantidad_sensores;
@@ -429,6 +461,10 @@ int main(int argc, char *argv[])
     int error;
 
     pid_t pid;
+    pid_t pids[MAX_SENSORES];
+    int sensores_creados = 0;
+    int estado;
+    int sensores_con_error = 0;
 
     mqd_t cola;
 
@@ -452,8 +488,17 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    cantidad_sensores = atoi(argv[1]);
-    mediciones_por_sensor = atoi(argv[2]);
+    if (convertir_entero(argv[1], &cantidad_sensores) == -1)
+    {
+        fprintf(stderr, "Error: cantidad de sensores invalida.\\n");
+        return EXIT_FAILURE;
+    }
+
+    if (convertir_entero(argv[2], &mediciones_por_sensor) == -1)
+    {
+        fprintf(stderr, "Error: cantidad de mediciones invalida.\\n");
+        return EXIT_FAILURE;
+    }
 
     if (cantidad_sensores < 1 ||
         cantidad_sensores > MAX_SENSORES)
@@ -542,7 +587,35 @@ int main(int argc, char *argv[])
 
         if (pid == -1)
         {
+            int j;
+
             perror("fork");
+
+            /* Detener los hijos que ya fueron creados. */
+            for (j = 0; j < sensores_creados; j++)
+            {
+                kill(pids[j], SIGTERM);
+            }
+
+            /* Esperar a todos para evitar zombies. */
+            for (j = 0; j < sensores_creados; j++)
+            {
+                while (waitpid(pids[j], NULL, 0) == -1 &&
+                       errno == EINTR)
+                {
+                    /* Reintentar si una senal interrumpe waitpid. */
+                }
+            }
+
+            sem_close(sem_estadisticas);
+            sem_unlink(SEM_ESTADISTICAS_NOMBRE);
+
+            munmap(memoria, sizeof(struct MemoriaCompartida));
+            shm_unlink(SHM_NOMBRE);
+
+            mq_close(cola);
+            mq_unlink(COLA_NOMBRE);
+
             return EXIT_FAILURE;
         }
 
@@ -564,6 +637,10 @@ int main(int argc, char *argv[])
 
             exit(EXIT_SUCCESS);
         }
+
+        /* Guardar el PID para poder esperar a este hijo. */
+        pids[sensores_creados] = pid;
+        sensores_creados++;
     }
 
     /*
@@ -588,11 +665,88 @@ int main(int argc, char *argv[])
 
         if (error != 0)
         {
-            fprintf(
-                stderr,
-                "Error creando worker %d\n",
-                i
-            );
+            int j;
+            int resultado_wait;
+            pid_t terminado;
+
+            fprintf(stderr,
+                    "Error creando worker %d: %s\n",
+                    i, strerror(error));
+
+            /*
+             * Detener los sensores que siguen ejecutandose.
+             */
+            for (j = 0; j < sensores_creados; j++)
+            {
+                if (kill(pids[j], SIGTERM) == -1 &&
+                    errno != ESRCH)
+                {
+                    perror("kill");
+                }
+            }
+
+            /*
+             * Esperar a los hijos para evitar zombies.
+             */
+            for (j = 0; j < sensores_creados; j++)
+            {
+                do
+                {
+                    terminado = waitpid(pids[j], NULL, 0);
+                }
+                while (terminado == -1 && errno == EINTR);
+
+                if (terminado == -1 && errno != ECHILD)
+                {
+                    perror("waitpid");
+                }
+            }
+
+            /*
+             * Ya no quedan productores.
+             * Enviar FIN a los workers que si se crearon.
+             */
+            fin.timestamp = time(NULL);
+            fin.valor = 0.0;
+            fin.sensor_id = SENSOR_FIN;
+
+            for (j = 0; j < i; j++)
+            {
+                if (mq_send(cola, (char *)&fin,
+                            sizeof(fin), 0) == -1)
+                {
+                    perror("mq_send fin");
+                }
+            }
+
+            /*
+             * Esperar a los workers existentes.
+             */
+            for (j = 0; j < i; j++)
+            {
+                resultado_wait = pthread_join(
+                    workers[j], NULL);
+
+                if (resultado_wait != 0)
+                {
+                    fprintf(stderr,
+                            "Error en pthread_join: %s\n",
+                            strerror(resultado_wait));
+                }
+            }
+
+            /*
+             * Liberar recursos IPC.
+             */
+            sem_close(sem_estadisticas);
+            sem_unlink(SEM_ESTADISTICAS_NOMBRE);
+
+            munmap(memoria,
+                   sizeof(struct MemoriaCompartida));
+            shm_unlink(SHM_NOMBRE);
+
+            mq_close(cola);
+            mq_unlink(COLA_NOMBRE);
 
             return EXIT_FAILURE;
         }
@@ -603,10 +757,30 @@ int main(int argc, char *argv[])
      * terminen de producir mediciones.
      */
     for (i = 0;
-         i < cantidad_sensores;
+         i < sensores_creados;
          i++)
     {
-        wait(NULL);
+        pid_t terminado;
+
+        do
+        {
+            terminado = waitpid(pids[i], &estado, 0);
+        }
+        while (terminado == -1 && errno == EINTR);
+
+        if (terminado == -1)
+        {
+            perror("waitpid");
+            sensores_con_error = 1;
+        }
+        else if (!WIFEXITED(estado) ||
+                 WEXITSTATUS(estado) != EXIT_SUCCESS)
+        {
+            fprintf(stderr,
+                    "Sensor con PID %ld termino con error.\n",
+                    (long)pids[i]);
+            sensores_con_error = 1;
+        }
     }
 
     /*
@@ -669,6 +843,11 @@ int main(int argc, char *argv[])
     printf(
         "\nProcesamiento terminado\n"
     );
+
+    if (sensores_con_error)
+    {
+        return EXIT_FAILURE;
+    }
 
     return EXIT_SUCCESS;
 }
