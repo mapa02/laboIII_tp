@@ -1,3 +1,8 @@
 colector
 *.o
 .DS_Store
+*.bak
+*.bak[0-9]*
+.vscode/
+consulta
+monitoreo.log
